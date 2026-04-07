@@ -1,9 +1,8 @@
 use tauri::{AppHandle, Runtime, command};
 
-use audio_player::Result;
-use audio_player::models::{AudioActionResponse, AudioMetadata, PlayerState};
-
 use crate::AudioExt;
+use crate::Result;
+use crate::models::{AudioActionResponse, AudioMetadata, PlayerState};
 
 #[command]
 pub(crate) async fn load<R: Runtime>(
@@ -44,7 +43,14 @@ pub(crate) async fn set_volume<R: Runtime>(app: AppHandle<R>, level: f64) -> Res
 
 #[command]
 pub(crate) async fn set_muted<R: Runtime>(app: AppHandle<R>, muted: bool) -> Result<PlayerState> {
-   Ok(app.audio().set_muted(muted))
+   #[cfg(not(target_os = "ios"))]
+   {
+      Ok(app.audio().set_muted(muted))
+   }
+   #[cfg(target_os = "ios")]
+   {
+      app.audio().set_muted(muted)
+   }
 }
 
 #[command]
@@ -57,17 +63,36 @@ pub(crate) async fn set_playback_rate<R: Runtime>(
 
 #[command]
 pub(crate) async fn set_loop<R: Runtime>(app: AppHandle<R>, looping: bool) -> Result<PlayerState> {
-   Ok(app.audio().set_loop(looping))
+   #[cfg(not(target_os = "ios"))]
+   {
+      Ok(app.audio().set_loop(looping))
+   }
+   #[cfg(target_os = "ios")]
+   {
+      app.audio().set_loop(looping)
+   }
 }
 
 #[command]
 pub(crate) async fn get_state<R: Runtime>(app: AppHandle<R>) -> Result<PlayerState> {
-   Ok(app.audio().get_state())
+   #[cfg(not(target_os = "ios"))]
+   {
+      Ok(app.audio().get_state())
+   }
+   #[cfg(target_os = "ios")]
+   {
+      app.audio().get_state()
+   }
 }
 
 #[command]
 pub(crate) async fn is_native<R: Runtime>(_app: AppHandle<R>) -> Result<bool> {
-   // Desktop is not "native" in the mobile plugin sense. When mobile implementations
-   // are added, this will return `true` on iOS/Android to switch the event transport.
-   Ok(false)
+   #[cfg(target_os = "ios")]
+   {
+      Ok(true)
+   }
+   #[cfg(not(target_os = "ios"))]
+   {
+      Ok(false)
+   }
 }

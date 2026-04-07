@@ -19,3 +19,7 @@ Thumbs.db
 
 # Tauri
 /gen/
+.tauri/
+
+# Swift
+.build/

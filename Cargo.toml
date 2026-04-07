@@ -13,12 +13,14 @@ links = "tauri-plugin-audio"
 exclude = ["/examples", "/dist-js", "/guest-js", "/node_modules"]
 
 [dependencies]
-audio-player = { path = "crates/audio-player" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.140"
 tauri = { version = "2.9.3" }
 thiserror = "2.0.17"
 tracing = { version = "0.1.41", default-features = false, features = ["std", "log", "release_max_level_warn"] }
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+audio-player = { path = "crates/audio-player" }
 
 [dev-dependencies]
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "macros", "time"] }
