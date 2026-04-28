@@ -13,3 +13,5 @@ serde = { version = "1.0.228", features = ["derive"] }
 thiserror = "2.0.17"
 tracing = { version = "0.1.41", default-features = false, features = ["std", "log"] }
 ureq = "2.12.1"
+id3 = "1.16.4"
+base64 = "0.22.1"
