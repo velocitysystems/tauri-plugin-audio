@@ -1,14 +1,17 @@
 use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use tracing::warn;
 
 use crate::error::{Error, Result};
-use crate::models::{AudioActionResponse, AudioMetadata, PlaybackStatus, PlayerState, TimeUpdate};
+use crate::models::{
+   AudioActionResponse, LoopMode, PlaybackStatus, PlayerState, PlaylistItem, TimeUpdate,
+};
 use crate::net::reject_private_host;
+use crate::transitions::NavTarget;
 use crate::{OnChanged, OnTimeUpdate, transitions};
 
 /// Maximum audio download size (100 MiB).
@@ -20,8 +23,11 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Audio player backed by Rodio for cross-platform desktop playback.
 ///
 /// Manages a dedicated audio output thread, a playback monitor for time updates
-/// and end-of-track detection, and a state machine matching the plugin's
+/// and end-of-track auto-advance, and a state machine matching the plugin's
 /// [`PlaybackStatus`] model.
+///
+/// Construct with [`RodioAudioPlayer::new`], which returns an `Arc` so the
+/// monitor thread can hold a weak self-reference for auto-advance callbacks.
 pub struct RodioAudioPlayer {
    inner: Arc<Mutex<Inner>>,
    stream_handle: OutputStreamHandle,
@@ -29,6 +35,9 @@ pub struct RodioAudioPlayer {
    _stream_keep_alive: std::sync::mpsc::Sender<()>,
    on_changed: OnChanged,
    on_time_update: OnTimeUpdate,
+   /// Weak self-reference so the monitor thread can call back without
+   /// keeping the player alive after its owner has dropped it.
+   weak_self: Weak<Self>,
 }
 
 struct Inner {
@@ -39,9 +48,9 @@ struct Inner {
 
 struct PlaybackContext {
    sink: Sink,
-   /// Raw audio bytes kept for looping re-append and replay from Ended.
-   /// Wrapped in `Arc` so re-append clones are cheap reference count bumps
-   /// instead of multi-megabyte copies.
+   /// Raw audio bytes for the current item, kept for looping re-append and
+   /// replay from `Ended`. `Arc` so re-append clones are cheap reference
+   /// count bumps instead of multi-megabyte copies.
    source_data: Arc<[u8]>,
    duration: f64,
 }
@@ -49,12 +58,12 @@ struct PlaybackContext {
 impl RodioAudioPlayer {
    /// Creates a new Rodio-backed audio player.
    ///
-   /// Opens the default audio output device on a dedicated thread. Returns an error
-   /// if no audio device is available.
-   pub fn new(on_changed: OnChanged, on_time_update: OnTimeUpdate) -> Result<Self> {
+   /// Opens the default audio output device on a dedicated thread. Returns an
+   /// error if no audio device is available.
+   pub fn new(on_changed: OnChanged, on_time_update: OnTimeUpdate) -> Result<Arc<Self>> {
       let stream_handle = open_audio_output()?;
 
-      Ok(Self {
+      Ok(Arc::new_cyclic(|weak_self| Self {
          inner: Arc::new(Mutex::new(Inner {
             state: PlayerState::default(),
             playback: None,
@@ -64,10 +73,10 @@ impl RodioAudioPlayer {
          _stream_keep_alive: stream_handle.keep_alive,
          on_changed,
          on_time_update,
-      })
+         weak_self: weak_self.clone(),
+      }))
    }
 
-   /// Stops the monitor thread by setting the flag.
    fn stop_monitor(inner: &Inner) {
       inner.monitor_stop.store(true, Ordering::Relaxed);
    }
@@ -78,19 +87,20 @@ impl RodioAudioPlayer {
    /// observes the stop flag on its next poll. This is harmless — any
    /// duplicate time updates are benign, and the state is already updated
    /// under the mutex before the new monitor starts, so the old one cannot
-   /// trigger a spurious Ended transition.
+   /// trigger a spurious advance.
    fn start_monitor(&self, inner: &mut Inner) {
       let stop = Arc::new(AtomicBool::new(false));
       inner.monitor_stop = stop.clone();
 
-      let inner_arc = Arc::clone(&self.inner);
-      let on_changed = Arc::clone(&self.on_changed);
-      let on_time_update = Arc::clone(&self.on_time_update);
+      let Some(player) = self.weak_self.upgrade() else {
+         warn!("Cannot start monitor: player has been dropped");
+         return;
+      };
 
       if let Err(e) = std::thread::Builder::new()
          .name("audio-monitor".into())
          .spawn(move || {
-            monitor_loop(stop, inner_arc, on_changed, on_time_update);
+            monitor_loop(stop, player);
          })
       {
          warn!("Failed to spawn audio monitor thread: {e}");
@@ -101,45 +111,54 @@ impl RodioAudioPlayer {
       lock_inner(&self.inner).state.clone()
    }
 
-   pub fn load(&self, src: &str, metadata: Option<AudioMetadata>) -> Result<AudioActionResponse> {
-      let meta = metadata.unwrap_or_default();
+   /// Loads a playlist and prepares the chosen (or first) item for playback.
+   pub fn load(
+      &self,
+      playlist: Vec<PlaylistItem>,
+      start_index: Option<usize>,
+   ) -> Result<AudioActionResponse> {
+      let start_index = start_index.unwrap_or(0);
 
       // Transition to Loading and notify the frontend before starting I/O.
-      {
+      let item_src = {
          let mut inner = lock_inner(&self.inner);
-         transitions::begin_load(&mut inner.state, src, &meta)?;
+         transitions::begin_load(&mut inner.state, playlist, start_index)?;
+         let src = inner
+            .state
+            .current()
+            .map(|item| item.src.clone())
+            .ok_or_else(|| Error::InvalidState("Missing current item after begin_load".into()))?;
          let snapshot = inner.state.clone();
          drop(inner);
          (self.on_changed)(&snapshot);
-      }
+         src
+      };
 
       // Perform I/O, decoding, and sink creation. If any step fails,
       // transition to Error so the frontend can recover from the Loading state.
-      let result = self.load_inner(src, &meta);
-
-      match result {
+      match self.load_inner(&item_src) {
          Ok(snapshot) => {
             (self.on_changed)(&snapshot);
             Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Ready))
          }
          Err(e) => {
-            let mut inner = lock_inner(&self.inner);
-            transitions::error(&mut inner.state, e.to_string());
-            let snapshot = inner.state.clone();
-            drop(inner);
+            let snapshot = {
+               let mut inner = lock_inner(&self.inner);
+               transitions::error(&mut inner.state, e.to_string());
+               inner.state.clone()
+            };
             (self.on_changed)(&snapshot);
             Err(e)
          }
       }
    }
 
-   /// Inner load logic that may fail. Separated so `load()` can catch errors
-   /// and transition to the Error state before propagating.
-   fn load_inner(&self, src: &str, meta: &AudioMetadata) -> Result<PlayerState> {
-      // Fetch audio data (may block on file I/O or HTTP download).
+   /// Inner load logic that performs I/O for an already-set current item and
+   /// finalizes the state to `Ready`. Used by `load`, `next`, `prev`, and
+   /// auto-advance.
+   fn load_inner(&self, src: &str) -> Result<PlayerState> {
       let data: Arc<[u8]> = load_source_data(src)?.into();
 
-      // Decode audio and extract duration.
       let source = Decoder::new(Cursor::new(Arc::clone(&data)))
          .map_err(|e| Error::Audio(format!("Failed to decode audio: {e}")))?;
       let duration = source
@@ -147,24 +166,24 @@ impl RodioAudioPlayer {
          .map(|d| d.as_secs_f64())
          .unwrap_or_else(|| probe_duration(&data).unwrap_or(0.0));
 
-      // Create a new sink, append the decoded source, and pause immediately
-      // so playback waits for an explicit play() call.
       let sink = Sink::try_new(&self.stream_handle)
          .map_err(|e| Error::Audio(format!("Failed to create audio sink: {e}")))?;
       sink.pause();
       sink.append(source);
 
-      // Commit the state transition under the lock.
       let mut inner = lock_inner(&self.inner);
 
-      // Re-check after I/O — another thread may have changed the state.
-      transitions::load(&mut inner.state, src, meta, duration)?;
+      transitions::load(&mut inner.state, duration)?;
 
       Self::stop_monitor(&inner);
 
-      // Apply current user settings to the new sink.
       sink.set_volume(effective_volume(&inner.state));
       sink.set_speed(inner.state.playback_rate as f32);
+
+      // Drop any existing context (previous item) before installing the new one.
+      if let Some(prev) = inner.playback.take() {
+         prev.sink.stop();
+      }
 
       inner.playback = Some(PlaybackContext {
          sink,
@@ -180,8 +199,6 @@ impl RodioAudioPlayer {
          let mut inner = lock_inner(&self.inner);
          let is_ended = inner.state.status == PlaybackStatus::Ended;
 
-         // Re-append source for replay from Ended before the transition
-         // mutates status.
          if is_ended
             && let Some(ctx) = &inner.playback
             && ctx.sink.empty()
@@ -234,8 +251,6 @@ impl RodioAudioPlayer {
 
          Self::stop_monitor(&inner);
 
-         // Clear the sink's queue before dropping so Sink::drop returns
-         // immediately instead of blocking until the audio drains.
          if let Some(ctx) = inner.playback.take() {
             ctx.sink.stop();
          }
@@ -255,7 +270,6 @@ impl RodioAudioPlayer {
          transitions::seek(&mut inner.state, position)?;
 
          if let Some(ctx) = &inner.playback {
-            // If ended, re-append the source so we have something to seek within.
             if was_ended {
                if let Some(source) = decode_arc(&ctx.source_data) {
                   ctx.sink.append(source);
@@ -277,6 +291,130 @@ impl RodioAudioPlayer {
       let expected = snapshot.status;
       (self.on_changed)(&snapshot);
       Ok(AudioActionResponse::new(snapshot, expected))
+   }
+
+   /// Advance to the next playlist item, with wrap-around if `loopMode` is `All`.
+   /// Errors with `InvalidState` from `Idle` / `Loading` / `Error`.
+   pub fn next(&self) -> Result<AudioActionResponse> {
+      self.navigate(Direction::Next)
+   }
+
+   /// Move to the previous item, or restart the current item if `currentTime > 3s`
+   /// or we're at the start of a non-looping playlist.
+   pub fn prev(&self) -> Result<AudioActionResponse> {
+      self.navigate(Direction::Prev)
+   }
+
+   /// Jump to a specific item in the loaded playlist by index.
+   ///
+   /// Errors with `InvalidState` from `Idle` / `Loading` / `Error` and with
+   /// `InvalidValue` if the index is out of range. Jumping to the currently
+   /// active index restarts that item from the beginning.
+   pub fn jump_to(&self, index: usize) -> Result<AudioActionResponse> {
+      let target = {
+         let inner = lock_inner(&self.inner);
+         transitions::jump_target(&inner.state, index)?
+      };
+
+      match target {
+         NavTarget::Index(idx) => self.advance_to(idx),
+         NavTarget::RestartCurrent => self.seek(0.0),
+         NavTarget::End => self.transition_to_ended(),
+      }
+   }
+
+   fn navigate(&self, direction: Direction) -> Result<AudioActionResponse> {
+      let target = {
+         let inner = lock_inner(&self.inner);
+         match direction {
+            Direction::Next => transitions::next_target(&inner.state)?,
+            Direction::Prev => transitions::prev_target(&inner.state)?,
+         }
+      };
+
+      match target {
+         NavTarget::Index(index) => self.advance_to(index),
+         NavTarget::RestartCurrent => self.seek(0.0),
+         NavTarget::End => self.transition_to_ended(),
+      }
+   }
+
+   /// Loads `playlist[index]` while preserving play intent — if the player was
+   /// `Playing` before the call, it resumes playing the new item once loaded.
+   ///
+   /// Always emits a `Loading` state-changed event before fetching, even when
+   /// the source bytes are already cached. The cache makes the Loading window
+   /// effectively instantaneous, but the event is preserved so consumers see
+   /// identical state-machine emissions on desktop and on native mobile
+   /// platforms (iOS AVPlayer / Android ExoPlayer always emit Loading).
+   fn advance_to(&self, index: usize) -> Result<AudioActionResponse> {
+      let (was_playing, item_src) = {
+         let mut inner = lock_inner(&self.inner);
+         let was_playing = inner.state.status == PlaybackStatus::Playing;
+
+         transitions::begin_load_index(&mut inner.state, index)?;
+
+         let src = inner
+            .state
+            .current()
+            .map(|item| item.src.clone())
+            .ok_or_else(|| Error::InvalidState("Missing current item after begin_load".into()))?;
+
+         Self::stop_monitor(&inner);
+         if let Some(ctx) = inner.playback.take() {
+            ctx.sink.stop();
+         }
+
+         let snapshot = inner.state.clone();
+         drop(inner);
+         (self.on_changed)(&snapshot);
+         (was_playing, src)
+      };
+
+      let ready_snapshot = match self.load_inner(&item_src) {
+         Ok(snapshot) => {
+            (self.on_changed)(&snapshot);
+            snapshot
+         }
+         Err(e) => {
+            let snapshot = {
+               let mut inner = lock_inner(&self.inner);
+               transitions::error(&mut inner.state, e.to_string());
+               inner.state.clone()
+            };
+            (self.on_changed)(&snapshot);
+            return Err(e);
+         }
+      };
+
+      if was_playing {
+         self.play()
+      } else {
+         Ok(AudioActionResponse::new(
+            ready_snapshot,
+            PlaybackStatus::Ready,
+         ))
+      }
+   }
+
+   /// Transitions to `Ended` when navigation falls off the end of a non-looping
+   /// playlist.
+   fn transition_to_ended(&self) -> Result<AudioActionResponse> {
+      let snapshot = {
+         let mut inner = lock_inner(&self.inner);
+
+         transitions::ended(&mut inner.state);
+
+         Self::stop_monitor(&inner);
+         if let Some(ctx) = &inner.playback {
+            ctx.sink.pause();
+         }
+
+         inner.state.clone()
+      };
+
+      (self.on_changed)(&snapshot);
+      Ok(AudioActionResponse::new(snapshot, PlaybackStatus::Ended))
    }
 
    pub fn set_volume(&self, level: f64) -> Result<PlayerState> {
@@ -321,16 +459,22 @@ impl RodioAudioPlayer {
       Ok(snapshot)
    }
 
-   pub fn set_loop(&self, looping: bool) -> PlayerState {
+   pub fn set_loop_mode(&self, mode: LoopMode) -> PlayerState {
       let snapshot = {
          let mut inner = lock_inner(&self.inner);
-         transitions::set_loop(&mut inner.state, looping);
+         transitions::set_loop_mode(&mut inner.state, mode);
          inner.state.clone()
       };
 
       (self.on_changed)(&snapshot);
       snapshot
    }
+}
+
+#[derive(Copy, Clone)]
+enum Direction {
+   Next,
+   Prev,
 }
 
 // ---------------------------------------------------------------------------
@@ -356,7 +500,6 @@ fn open_audio_output() -> Result<AudioOutput> {
       .spawn(move || match OutputStream::try_default() {
          Ok((_stream, handle)) => {
             let _ = result_tx.send(Ok(handle));
-            // Block until the keep_alive sender is dropped.
             let _ = keep_alive_rx.recv();
          }
          Err(e) => {
@@ -381,12 +524,11 @@ fn open_audio_output() -> Result<AudioOutput> {
 // ---------------------------------------------------------------------------
 
 /// Polls the sink every 250ms for position updates and end-of-track detection.
-fn monitor_loop(
-   stop: Arc<AtomicBool>,
-   inner: Arc<Mutex<Inner>>,
-   on_changed: OnChanged,
-   on_time_update: OnTimeUpdate,
-) {
+///
+/// On end-of-track, consults [`transitions::auto_advance_target`] to decide
+/// whether to restart the current item, advance to the next item, or
+/// transition to `Ended`.
+fn monitor_loop(stop: Arc<AtomicBool>, player: Arc<RodioAudioPlayer>) {
    loop {
       std::thread::sleep(Duration::from_millis(250));
 
@@ -394,7 +536,7 @@ fn monitor_loop(
          break;
       }
 
-      let mut guard = lock_inner(&inner);
+      let mut guard = lock_inner(&player.inner);
 
       let (pos, duration, is_empty) = match &guard.playback {
          Some(ctx) => (
@@ -406,31 +548,42 @@ fn monitor_loop(
       };
 
       if is_empty {
-         if guard.state.looping {
-            // Re-append source for seamless (best-effort) loop.
-            if let Some(ctx) = &guard.playback
-               && let Some(source) = decode_arc(&ctx.source_data)
-            {
-               ctx.sink.append(source);
+         let target = transitions::auto_advance_target(&guard.state);
+         match target {
+            NavTarget::RestartCurrent => {
+               if let Some(ctx) = &guard.playback
+                  && let Some(source) = decode_arc(&ctx.source_data)
+               {
+                  ctx.sink.append(source);
+               }
+               guard.state.current_time = 0.0;
+               drop(guard);
+               (player.on_time_update)(&TimeUpdate {
+                  current_time: 0.0,
+                  duration,
+               });
             }
-            guard.state.current_time = 0.0;
-            drop(guard);
-            on_time_update(&TimeUpdate {
-               current_time: 0.0,
-               duration,
-            });
-         } else {
-            guard.state.status = PlaybackStatus::Ended;
-            guard.state.current_time = duration;
-            let snapshot = guard.state.clone();
-            drop(guard);
-            on_changed(&snapshot);
-            break;
+            NavTarget::Index(idx) => {
+               // Drop the lock before invoking `advance_to` (which re-acquires).
+               drop(guard);
+               if let Err(e) = player.advance_to(idx) {
+                  warn!("Auto-advance failed: {e}");
+               }
+               // `advance_to` (via `play`) starts a fresh monitor; this one exits.
+               break;
+            }
+            NavTarget::End => {
+               transitions::ended(&mut guard.state);
+               let snapshot = guard.state.clone();
+               drop(guard);
+               (player.on_changed)(&snapshot);
+               break;
+            }
          }
       } else {
          guard.state.current_time = pos;
          drop(guard);
-         on_time_update(&TimeUpdate {
+         (player.on_time_update)(&TimeUpdate {
             current_time: pos,
             duration,
          });
@@ -466,9 +619,6 @@ fn effective_volume(state: &PlayerState) -> f32 {
 }
 
 /// Probes audio data with symphonia to determine duration from container metadata.
-///
-/// This succeeds for most common formats (MP3, FLAC, WAV, OGG, AAC) where
-/// `rodio::Decoder::total_duration()` returns `None`.
 fn probe_duration(data: &Arc<[u8]>) -> Option<f64> {
    use symphonia::core::formats::FormatOptions;
    use symphonia::core::io::MediaSourceStream;
@@ -508,7 +658,6 @@ fn load_source_data(src: &str) -> Result<Vec<u8>> {
          .call()
          .map_err(|e| Error::Http(format!("Failed to fetch {src}: {e}")))?;
 
-      // Reject early if Content-Length exceeds the limit.
       if let Some(len) = resp
          .header("content-length")
          .and_then(|v| v.parse::<u64>().ok())
@@ -519,7 +668,6 @@ fn load_source_data(src: &str) -> Result<Vec<u8>> {
          )));
       }
 
-      // Enforce the limit regardless of Content-Length (it can be absent or spoofed).
       let mut bytes = Vec::new();
       resp
          .into_reader()
